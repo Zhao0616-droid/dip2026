@@ -1,8 +1,6 @@
-"""通用视频运动目标跟踪：单文件课程实验。
-python main.py --make-demo
-python main.py --source data/demo.avi
-python main.py --source 0
-"""
+# python main.py --make-demo
+# python main.py --source data/demo.avi
+# python main.py --source 0
 import argparse
 import csv
 from pathlib import Path
@@ -11,43 +9,45 @@ from math import hypot
 import cv2
 import numpy as np
 
-# ==================== 预处理 ====================
-"""预处理：对应实验2亮度加减、实验5滤波与卷积。"""
-
-
-def preprocess(frame, brightness=20, sharpen=True):
-    # 灰度表示简化后续计算；固定亮度偏移避免逐帧均衡化引起背景变化。
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    corrected = cv2.add(gray, brightness) if brightness >= 0 else cv2.subtract(gray, -brightness)
+# 预处理：亮度加减、滤波与卷积。
+def preprocess(frame):
+    # 三个颜色通道同时增亮20
+    corrected = cv2.add(frame, (50, 50, 50, 0))
     blurred = cv2.GaussianBlur(corrected, (5, 5), 0)
-    # 温和的拉普拉斯锐化卷积：中心增强、相邻像素相减。
+    # 拉普拉斯锐化卷积
     kernel = np.array([[0, -.2, 0], [-.2, 1.8, -.2], [0, -.2, 0]], dtype=np.float32)
-    enhanced = cv2.filter2D(blurred, -1, kernel) if sharpen else blurred.copy()
+    enhanced = cv2.filter2D(blurred, -1, kernel)
     return corrected, blurred, enhanced
 
-# ==================== 分割与目标表示 ====================
-"""背景差分与形态学：对应实验2差运算、实验6阈值与开闭运算。"""
-
-
+#分割与目标表示：背景差分与形态学
 class Segmenter:
-    def __init__(self, threshold=25):
+    def __init__(self, threshold=25, stable_frames=50):
+        self.stable_frames = stable_frames
+        self.previous = None
+        self.stable_count = None
         self.background = None
         self.threshold = threshold
-
     def reset(self, image):
-        # 参考背景固定不更新；采集时画面应没有待跟踪目标。
+        # 重设背景，同时清空逐像素的稳定时间。
         self.background = image.copy()
-
+        self.previous = image.copy()
+        self.stable_count = np.zeros(image.shape, np.uint16)
     def process(self, image):
         if self.background is None:
             self.reset(image)
+        # 连续稳定约两秒的像素更新为背景，清除首帧目标离开后的残影。
+        stable = cv2.absdiff(image, self.previous) <= 3
+        self.stable_count = np.where(
+            stable, np.minimum(self.stable_count.astype(np.uint32) + 1,
+                               self.stable_frames), 0).astype(np.uint16)
+        settled = self.stable_count >= self.stable_frames
+        self.background[settled] = image[settled]
+        self.previous = image.copy()
         difference = cv2.absdiff(image, self.background)
         _, binary = cv2.threshold(difference, self.threshold, 255, cv2.THRESH_BINARY)
         opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
         return difference, binary, opened, closed
-
-
 def detect(mask, min_area=400):
     # 将分割区域表示为轮廓、外接矩形、质心和面积。
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -63,10 +63,7 @@ def detect(mask, min_area=400):
         detections.append({'center': center, 'box': cv2.boundingRect(contour), 'area': area})
     return detections
 
-# ==================== 质心跟踪 ====================
-"""基础质心跟踪：距离计算与一对一匹配，不使用学习模型。"""
-
-
+# 质心跟踪：距离计算与一对一匹配
 class CentroidTracker:
     def __init__(self, max_distance=80, max_missing=10):
         self.max_distance = max_distance
@@ -105,13 +102,9 @@ class CentroidTracker:
         # 漏检目标暂时保留用于重关联，但不在当前画面绘制旧框。
         return {identity: track for identity, track in self.tracks.items() if track['missing'] == 0}
 
-# ==================== 多窗口与绘图 ====================
-"""九个独立窗口展示流程；窗口标题用英文避免OpenCV中文乱码。"""
-
+#九个独立窗口展示
 TITLES = ['01 Original', '02 Brightness', '03 Gaussian', '04 Sharpen',
           '05 Difference', '06 Threshold', '07 Opening', '08 Closing', '09 Tracking']
-
-
 def draw_tracks(frame, tracks):
     result = frame.copy()
     for identity, track in tracks.items():
@@ -125,8 +118,6 @@ def draw_tracks(frame, tracks):
     cv2.putText(result, f'Targets: {len(tracks)} | B: background SPACE: pause Q: quit',
                 (10, 24), cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 255, 0), 1)
     return result
-
-
 class Display:
     def __init__(self):
         for i, title in enumerate(TITLES):
@@ -141,7 +132,7 @@ class Display:
     def closed(self):
         return any(cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1 for title in TITLES)
 
-# ==================== 演示视频生成 ====================
+# 演示视频
 def make_demo():
     folder = Path(__file__).parent / 'data'
     folder.mkdir(exist_ok=True)
@@ -162,40 +153,32 @@ def make_demo():
 
 
 
-# ==================== 输入与主流程 ====================
+# 主流程
 def main():
     parser = argparse.ArgumentParser(description='Basic motion target tracking')
     parser.add_argument('--make-demo', action='store_true', help='Generate demo and exit')
     parser.add_argument('--source', default='0', help='Video path or camera index')
-    parser.add_argument('--brightness', type=int, default=20)
-    parser.add_argument('--threshold', type=int, default=25)
-    parser.add_argument('--min-area', type=float, default=400)
-    parser.add_argument('--max-distance', type=float, default=80)
-    parser.add_argument('--width', type=int, default=800)
-    parser.add_argument('--no-sharpen', action='store_true')
     parser.add_argument('--save', action='store_true', help='Save annotated video and CSV')
     parser.add_argument('--headless', action='store_true', help='Run without display for validation')
     args = parser.parse_args()
     if args.make_demo:
         make_demo()
         return
-    if not 0 <= args.threshold <= 255 or not -255 <= args.brightness <= 255:
-        parser.error('Threshold must be 0..255; brightness must be -255..255')
-    if args.width < 1 or args.min_area <= 0 or args.max_distance <= 0:
-        parser.error('Width, min-area and max-distance must be positive')
+    width = 800
     source = int(args.source) if args.source.isdecimal() else args.source
     capture = cv2.VideoCapture(source)
     if not capture.isOpened():
         capture.release()
         raise SystemExit(f'Cannot open source: {args.source}')
-    segmenter = Segmenter(args.threshold)
-    tracker = CentroidTracker(args.max_distance)
+    segmenter = Segmenter()
+    tracker = CentroidTracker()
     writer = csv_file = None
     display = None
     frame_index = 0
     fps = capture.get(cv2.CAP_PROP_FPS)
     if not 1 <= fps <= 240:
         fps = 25
+    segmenter.stable_frames = max(1, round(fps * 2))
     try:
         display = None if args.headless else Display()
         while True:
@@ -203,18 +186,20 @@ def main():
             if not ok:
                 break
             # 统一宽度：面积阈值和匹配距离均以处理后的像素为单位。
-            height = max(1, round(frame.shape[0]*args.width/frame.shape[1]))
-            frame = cv2.resize(frame, (args.width, height))
-            corrected, blurred, enhanced = preprocess(frame, args.brightness, not args.no_sharpen)
-            diff, binary, opened, closed = segmenter.process(enhanced)
-            tracks = tracker.update(detect(closed, args.min_area))
+            height = max(1, round(frame.shape[0]*width/frame.shape[1]))
+            frame = cv2.resize(frame, (width, height))
+            corrected, blurred, enhanced = preprocess(frame)
+            # 彩色预处理完成后转为灰度，供差分和二值分割使用。
+            gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
+            diff, binary, opened, closed = segmenter.process(gray)
+            tracks = tracker.update(detect(closed))
             result = draw_tracks(frame, tracks)
             frame_index += 1
             if args.save:
                 if writer is None:
                     output = Path(__file__).parent / 'output'
                     output.mkdir(exist_ok=True)
-                    writer = cv2.VideoWriter(str(output/'tracking.avi'), cv2.VideoWriter_fourcc(*'MJPG'), fps, (args.width, height))
+                    writer = cv2.VideoWriter(str(output/'tracking.avi'), cv2.VideoWriter_fourcc(*'MJPG'), fps, (width, height))
                     if not writer.isOpened():
                         raise RuntimeError('Video encoder could not open')
                     csv_file = (output/'tracks.csv').open('w', newline='', encoding='utf-8-sig')
@@ -231,8 +216,8 @@ def main():
                 if key in (27, ord('q')) or display.closed():
                     break
                 if key == ord('b'):
-                    segmenter.reset(enhanced)
-                    tracker = CentroidTracker(args.max_distance)
+                    segmenter.reset(gray)
+                    tracker = CentroidTracker()
         print(f'Processed {frame_index} frames')
     finally:
         capture.release()
